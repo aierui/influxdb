@@ -6,9 +6,10 @@ orbs:
 executors:
   cross-builder:
     docker:
-      # NOTE: To upgrade the Go version, first push the upgrade to the cross-builder Dockerfile
-      # in the edge repo, then update the version here to match.
-      - image: quay.io/influxdb/cross-builder:go1.17.8-d52942c853d412a5bbcc92f5d78c7c5126c0730d
+      # NOTE: To upgrade the Go version, first push the upgrade to the cross-builder Dockerfile in the edge repo,
+      # then update the version here to match. Until we finish the migration to using the cross-builder image,
+      # you'll also need to update references to `cimg/go` and `GO_VERSION` in this file.
+      - image: quay.io/influxdb/cross-builder:go1.17.2-f7b4e805fa9588c1c2fa4562ea29e576557fb797
     resource_class: large
   linux-amd64:
     machine:
@@ -29,29 +30,43 @@ executors:
       resource_class: windows.medium
     shell: bash.exe -eo pipefail
 
-test_filter: &test_filter
-  filters:
-    tags:
-      ignore: /.*/
-    branches:
-      only:
-        - /^v[0-9]+\.[0-9]+\.[0-9]+(-(rc|alpha|beta)\.[0-9]+)?-test$/
-
-release_filter: &release_filter
-  filters:
-    tags:
-      only:
-        - /^v[0-9]+\.[0-9]+\.[0-9]+(-(rc|alpha|beta)\.[0-9]+)?$/
-    branches:
-      ignore: /.*/
+parameters:
+  aws_teardown:
+    default: false
+    type: boolean
+  aws_teardown_branch:
+    default: "n/a"
+    type: string
+  aws_teardown_sha:
+    default: "n/a"
+    type: string
+  aws_teardown_datestring:
+    default: "n/a"
+    type: string
+  aws_teardown_query_format:
+    default: "n/a"
+    type: string
+  build_and_sign:
+    default: false
+    type: boolean
+  build_and_sign_tag:
+    default: ""
+    type: string
 
 workflows:
   version: 2
   build:
+    when:
+      not:
+        or:
+          - << pipeline.parameters.aws_teardown >>
+          - << pipeline.parameters.build_and_sign >>
     jobs:
-      - test-race
+      - godeps
+      - test-race:
+          # TODO: Remove this alias as part of https://github.com/influxdata/influxdb/issues/22623
+          name: gotest
       - test-build:
-          name: test-build-<< matrix.os >>-<< matrix.arch >>
           matrix:
             parameters:
               os: [ linux, darwin, windows ]
@@ -69,84 +84,88 @@ workflows:
           name: test-linux-arm64
           executor: linux-arm64
           requires:
-            - test-build-linux-arm64
+            - test-build-arm64-linux
       - test-prebuilt:
           name: test-darwin
           executor: darwin
           requires:
-            - test-build-darwin-amd64
+            - test-build-amd64-darwin
       - test-prebuilt:
           name: test-windows
           executor: windows
           requires:
-            - test-build-windows-amd64
-      - fluxtest
-      - tlstest
-      - lint
-      - build:
-          name: build-snapshot-<< matrix.os >>-<< matrix.arch >>
-          build-type: snapshot
-          matrix:
-            parameters:
-              os: [ linux, darwin, windows ]
-              arch: [ amd64, arm64 ]
-            exclude:
-              - os: darwin
-                arch: arm64
-              - os: windows
-                arch: arm64
-      - package-and-release:
-          name: package-snapshot
-          build-type: snapshot
-          filters:
-            branches:
-              ignore: /pull\/[0-9]+/
+            - test-build-amd64-windows
+      - fluxtest:
           requires:
-            - build
+            - godeps
+      - tlstest:
+          requires:
+            - godeps
+      - lint:
+          # TODO: Remove this alias as part of https://github.com/influxdata/influxdb/issues/22623
+          name: golint
+      - build:
+          requires:
+            - godeps
+      - cross_build:
+          requires:
+            - godeps
       - test-downgrade:
           requires:
-            - build-snapshot-linux-amd64
+            - build
       - e2e-monitor-ci:
           filters:
             branches:
               ignore: /pull\/[0-9]+/
           requires:
-            - build-snapshot-linux-amd64
-      - test-linux-packages:
+            - build
+      - pkg_run_test:
           filters:
             branches:
               ignore: /pull\/[0-9]+/
           requires:
-            - package-snapshot
-      - perf-test:
-          record_results: true
+            - cross_build
+      - perf_test:
+          name: perf-test-flux
+          format: flux-http
+          record_ingest_results: true
           requires:
-            - package-snapshot
+            - cross_build
           filters:
             branches:
               only:
-                - master
-      - grace-test:
+                - "2.1"
+      - perf_test:
+          name: perf-test-influxql
+          format: http
+          record_ingest_results: false
           requires:
-            - build-snapshot-linux-amd64
-      - litmus-smoke-test:
-          requires:
-            - build-snapshot-linux-amd64
-      - litmus-full-test:
-          requires:
-            - build-snapshot-linux-amd64
+            - cross_build
           filters:
             branches:
-              only: master
+              only:
+                - "2.1"
+      - grace_daily:
+          requires:
+            - build
+      - litmus_daily:
+          requires:
+            - build
+      - litmus_integration:
+          requires:
+            - build
+          filters:
+            branches:
+              only: "2.1"
       - share-testing-image:
           filters:
             branches:
               only:
-                - master
+                - "2.1"
           requires:
             - e2e-monitor-ci
 
-  aws-destroy-daily:
+  aws_destroy_daily:
     triggers:
       - schedule:
           # run every day at 10pm -- note: use spaces, not tabs
@@ -154,9 +173,13 @@ workflows:
           filters:
             branches:
               only:
-                - "master"
+                - "2.1"
     jobs:
-      - aws-destroy-by-date
+      - aws_destroy_by_date
+  aws_destroy_callback:
+    when: << pipeline.parameters.aws_teardown >>
+    jobs:
+      - aws_destroy_by_name
 
   nightly:
     triggers:
@@ -165,12 +188,14 @@ workflows:
           filters:
             branches:
               only:
-                - master
+                - "2.1"
     jobs:
       - changelog
-      - test-race
+      - godeps
+      - test-race:
+          # TODO: Remove this alias as part of https://github.com/influxdata/influxdb/issues/22623
+          name: gotest
       - test-build:
-          name: test-build-<< matrix.os >>-<< matrix.arch >>
           matrix:
             parameters:
               os: [ linux, darwin, windows ]
@@ -188,76 +213,128 @@ workflows:
           name: test-linux-arm64
           executor: linux-arm64
           requires:
-            - test-build-linux-arm64
+            - test-build-arm64-linux
       - test-prebuilt:
           name: test-darwin
           executor: darwin
           requires:
-            - test-build-darwin-amd64
+            - test-build-amd64-darwin
       - test-prebuilt:
           name: test-windows
           executor: windows
           requires:
-            - test-build-windows-amd64
-      - lint
-      - fluxtest
-      - tlstest
-      - build:
-          name: build-nightly-<< matrix.os >>-<< matrix.arch >>
-          build-type: nightly
-          matrix:
-            parameters:
-              os: [ linux, darwin, windows ]
-              arch: [ amd64, arm64 ]
-            exclude:
-              - os: darwin
-                arch: arm64
-              - os: windows
-                arch: arm64
-      - package-and-release:
-          name: package-and-upload-nightly
-          build-type: nightly
+            - test-build-amd64-windows
+      - lint:
+          # TODO: Remove this alias as part of https://github.com/influxdata/influxdb/issues/22623
+          name: golint
+      - fluxtest:
           requires:
-            - build
+            - godeps
+      - tlstest:
+          requires:
+            - godeps
+      - deploy_nightly:
+          requires:
             - changelog
-      - litmus-full-test:
+            - gotest
+            - golint
+            - tlstest
+          filters:
+            branches:
+              only:
+                - "2.1"
+      - litmus_integration:
           requires:
-            - build-nightly-linux-amd64
-      - grace-test:
+            - deploy_nightly
+      - grace_daily:
           requires:
-            - build-nightly-linux-amd64
+            - deploy_nightly
+
+  build_and_sign_workflow:
+    when:
+      and:
+        - << pipeline.parameters.build_and_sign >>
+        - << pipeline.parameters.build_and_sign_tag >>
+    jobs:
+      - changelog
+      - release:
+          requires:
+            - changelog
 
   release:
     jobs:
-      # - godeps:
-      #     <<: *test_filter
-      # - test-race:
-      #     <<: *test_filter
-      #     # TODO: Remove this alias as part of https://github.com/influxdata/influxdb/issues/22623
-      #     name: gotest
-      # - fluxtest:
-      #     <<: *test_filter
-      #     requires:
-      #       - godeps
-      # - tlstest:
-      #     <<: *test_filter
-      #     requires:
-      #       - godeps
-      # - lint:
-      #     <<: *test_filter
-      #     # TODO: Remove this alias as part of https://github.com/influxdata/influxdb/issues/22623
-      #     name: golint
+      - godeps:
+          filters:
+            branches:
+              ignore: /.*/
+            tags:
+              only:
+                - /^v[0-9]+\.[0-9]+\.[0-9]+(-(rc|alpha|beta)\.[0-9]+)?$/
+                - /^.*test$/
+      - test-race:
+          # TODO: Remove this alias as part of https://github.com/influxdata/influxdb/issues/22623
+          name: gotest
+          filters:
+            branches:
+              ignore: /.*/
+            tags:
+              only:
+                - /^v[0-9]+\.[0-9]+\.[0-9]+(-(rc|alpha|beta)\.[0-9]+)?$/
+                - /^.*test$/
+      - fluxtest:
+          requires:
+            - godeps
+          filters:
+            branches:
+              ignore: /.*/
+            tags:
+              only:
+                - /^v[0-9]+\.[0-9]+\.[0-9]+(-(rc|alpha|beta)\.[0-9]+)?$/
+                - /^.*test$/
+      - tlstest:
+          requires:
+            - godeps
+          filters:
+            branches:
+              ignore: /.*/
+            tags:
+              only:
+                - /^v[0-9]+\.[0-9]+\.[0-9]+(-(rc|alpha|beta)\.[0-9]+)?$/
+                - /^.*test$/
+      - lint:
+          # TODO: Remove this alias as part of https://github.com/influxdata/influxdb/issues/22623
+          name: golint
+          filters:
+            branches:
+              ignore: /.*/
+            tags:
+              only:
+                - /^v[0-9]+\.[0-9]+\.[0-9]+(-(rc|alpha|beta)\.[0-9]+)?$/
+                - /^.*test$/
       - changelog:
-          <<: *test_filter
-          # requires:
-          #   - gotest
-          #   - fluxtest
-          #   - tlstest
-          #   - golint
+          requires:
+            - gotest
+            - fluxtest
+            - tlstest
+            - golint
+          filters:
+            branches:
+              ignore: /.*/
+            tags:
+              only:
+                - /^v[0-9]+\.[0-9]+\.[0-9]+(-(rc|alpha|beta)\.[0-9]+)?$/
+                - /^.*test$/
       - release:
-          <<: *test_filter
           requires:
             - changelog
+          filters:
+            branches:
+              ignore: /.*/
+            tags:
+              only:
+                - /^v[0-9]+\.[0-9]+\.[0-9]+(-(rc|alpha|beta)\.[0-9]+)?$/
+                - /^.*test$/
+
 commands:
   # Install system dependencies needed to run a native build of influxd
   install_core_deps:
@@ -441,39 +518,65 @@ commands:
                 name: Build release
                 # `goreleaser release --skip-publish` builds Docker images, but doesn't push them.
                 # As opposed to `goreleaser build`, which stops before building Dockers.
-                command: |
-                  set -x
-                  VERSION=2.2.1-${CIRCLE_SHA1}   \
-                  S3_FOLDER="influxdb/releases/" \
-                  goreleaser release \
-                    -p 1             \
-                    --debug          \
-                    --rm-dist        \
-                    --skip-publish   \
-                    --skip-sign      \
-                    --skip-validate
+                command: S3_FOLDER="influxdb/releases/" VERSION="$(git describe | sed 's/^v//' | sed 's/^[a-zA-Z]/2\.1-&/')" goreleaser --debug release --skip-publish --skip-sign -p 1 --rm-dist --skip-validate
       - when:
           condition:
-            << parameters.publish_release >>
+            and:
+              - << parameters.publish_release >>
+              - not:
+                  matches:
+                    pattern: "^.*test$"
+                    value: << pipeline.git.tag >>
           steps:
             - run:
-                name: Publish Test Release
+                name: Publish release
                 command: |
-                  set -x
-                  S3_FOLDER="platform/nightlies/bnp_test" \
-                  VERSION=2.2.1-${CIRCLE_SHA1} \
-                  goreleaser release \
-                    -p 1             \
-                    --debug          \
-                    --rm-dist        \
-                    --skip-publish   \
-                    --skip-sign      \
-                    --skip-validate
-                  # goreleaser release \
-                  #    -p 1            \
-                  #    --debug         \
-                  #    --rm-dist       \
-                  #    --skip-validate
+                  VERSION_TAG="${CIRCLE_TAG}"
+                  if [ -n "<< parameters.build_tag >>" ]; then
+                    VERSION_TAG="<< parameters.build_tag >>"
+                  fi
+                  S3_FOLDER="influxdb/releases/" \
+                  VERSION=${VERSION_TAG##v} \
+                  GORELEASER_CURRENT_TAG=${VERSION_TAG} \
+                  goreleaser \
+                    --debug \
+                    release \
+                      -p 1 \
+                      --rm-dist \
+                      --skip-validate
+      - when:
+          condition:
+            and:
+              - << parameters.publish_release >>
+              - matches:
+                  pattern: "^.*test$"
+                  value: << pipeline.git.tag >>
+          steps:
+            - run:
+                name: Publish release
+                command: |
+                  S3_FOLDER="platform/nightlies/test" \
+                  VERSION=2.1-${CIRCLE_TAG} \
+                  goreleaser \
+                    --debug \
+                    release \
+                      -p 1 \
+                      --rm-dist \
+                      --skip-validate
+      - when:
+          condition: << parameters.nightly >>
+          steps:
+            - run:
+                name: Publish nightly
+                command: |
+                  S3_FOLDER="platform/nightlies/2.1" \
+                  VERSION="2.1-nightly" \
+                  goreleaser \
+                    --debug \
+                    release \
+                      -p 1 \
+                      --rm-dist \
+                      --skip-validate
 
   quay_login:
     steps:
@@ -492,11 +595,15 @@ commands:
             fi
 
 jobs:
+  #########################
+  ### Backend-only jobs ###
+  #########################
+
   godeps:
     docker:
       - image: cimg/go:1.17.2
-    # environment:
-    #   TMPDIR: /mnt/ramdisk
+    environment:
+      TMPDIR: /mnt/ramdisk
     working_directory: /home/circleci/go/src/github.com/influxdata/influxdb
     steps:
       - checkout
@@ -510,28 +617,6 @@ jobs:
           key: influxdb-gomod-sum-{{ checksum "go.sum" }}
           paths:
             - /home/circleci/go/pkg/mod
-
-  release:
-    executor: linux-amd64
-    environment:
-      TMPDIR: /mnt/ramdisk
-    working_directory: /home/circleci/go/src/github.com/influxdata/influxdb
-    steps:
-      - checkout
-      - run:
-          name: Create RAM disk
-          command: |
-            sudo mkdir -p ${TMPDIR}
-            sudo mount -t tmpfs -o size=4G tmpfs ${TMPDIR}
-      - restore_cache:
-          name: Restore GOPATH/pkg/mod
-          keys:
-            - influxdb-gomod-sum-{{ checksum "go.sum" }}
-      - install_core_deps
-      - upgrade_go
-      - run_goreleaser:
-          publish_release: true
-          build_tag: v2.2.1
 
   lint:
     executor: cross-builder
@@ -623,91 +708,121 @@ jobs:
           destination: raw-test-results
 
   fluxtest:
-    executor: cross-builder
+    docker:
+      - image: cimg/go:1.17.2
+    environment:
+      TMPDIR: /mnt/ramdisk
+    working_directory: /home/circleci/go/src/github.com/influxdata/influxdb
     steps:
       - checkout
+      - restore_cache:
+          name: Restore GOPATH/pkg/mod
+          keys:
+            - influxdb-gomod-sum-{{ checksum "go.sum" }}
+      - install_core_deps
       - run: make test-flux
 
   tlstest:
-    executor: cross-builder
+    docker:
+      - image: cimg/go:1.17.2
+    environment:
+      TMPDIR: /mnt/ramdisk
+    working_directory: /home/circleci/go/src/github.com/influxdata/influxdb
     steps:
       - checkout
+      - restore_cache:
+          name: Restore GOPATH/pkg/mod
+          keys:
+            - influxdb-gomod-sum-{{ checksum "go.sum" }}
+      - install_core_deps
       - run: make test-tls
 
+  #####################################
+  ### UI+backend build/release jobs ###
+  #####################################
+
   build:
-    executor: cross-builder
-    parameters:
-      os:
-        type: string
-      arch:
-        type: string
-      build-type:
-        type: string
+    docker:
+      - image: cimg/go:1.17.2
+    resource_class: large
+    environment:
+      TMPDIR: /mnt/ramdisk
+    working_directory: /home/circleci/go/src/github.com/influxdata/influxdb
     steps:
       - checkout
-      - run:
-          name: Generate UI assets
-          command: make generate-web-assets
-      - run:
-          name: Build binaries
-          command: |
-            export GOOS=<< parameters.os >>
-            export GOARCH=<< parameters.arch >>
-            ./scripts/ci/build.sh "bin/influxd_$(go env GOOS)_$(go env GOARCH)" "<< parameters.build-type >>" ./cmd/influxd
+      - restore_cache:
+          name: Restore GOPATH/pkg/mod
+          keys:
+            - influxdb-gomod-sum-{{ checksum "go.sum" }}
+      - install_core_deps
+      - install_cross_bin_deps
+      # Build the static binary for linux
+      - run: S3_FOLDER="influxdb/releases/" VERSION="$(git describe | sed 's/^v//' | sed 's/^[a-zA-Z]/2\.1-&/')" goreleaser build --snapshot --single-target
       - store_artifacts:
-          path: bin
+          path: dist
       - persist_to_workspace:
           root: .
           paths:
-            - bin
+            - project
+            - dist/influxd_linux_amd64/influxd
+            - etc/litmus_success_notify.sh
+            - etc/litmus_fail_notify.sh
+      - run:
+          name: Exit the job with success if running on a fork
+          command: |
+            if [ -n "$CIRCLE_PR_NUMBER" ]; then
+                circleci-agent step halt
+            fi
+      - setup_remote_docker:
+          version: 19.03.13
+          docker_layer_caching: true
+      - run:
+          name: Build the candidate docker image
+          command: |
+            cp dist/influxd_linux_amd64/influxd .
+            docker build -f docker/influxd/Dockerfile -t quay.io/influxdb/oss-acceptance:${CIRCLE_SHA1} .
+            docker save -o docker-image.tar quay.io/influxdb/oss-acceptance:${CIRCLE_SHA1}
+      - persist_to_workspace:
+          root: .
+          paths:
+            - docker-image.tar
+      - quay_login
+      - run:
+          name: Push the candidate image to quay
+          command: docker push quay.io/influxdb/oss-acceptance:${CIRCLE_SHA1}
 
-  package-and-release:
+  cross_build:
     executor: linux-amd64
-    parameters:
-      build-type:
-        type: string
+    environment:
+      TMPDIR: /mnt/ramdisk
     steps:
       - checkout
-      - attach_workspace:
-          at: .
       - run:
-          name: Compute artifact version
-          command: echo "export GORELEASER_CURRENT_TAG='$(build-version.sh << parameters.build-type >>)'" >> $BASH_ENV
-      - unless:
-          condition:
-            equal: [ release, << parameters.build-type >> ]
-          steps:
-            - run:
-                name: Tag commit locally to pass goreleaser validation
-                command: git tag "$GORELEASER_CURRENT_TAG"
-      - run:
-          name: Import GPG key
+          name: Create RAM disk
           command: |
-            echo -e "$GPG_PRIVATE_KEY" > private.key
-            gpg --batch --import private.key
+            sudo mkdir -p ${TMPDIR}
+            sudo mount -t tmpfs -o size=4G tmpfs ${TMPDIR}
+      - restore_cache:
+          name: Restore GOPATH/pkg/mod
+          keys:
+            - influxdb-gomod-sum-{{ checksum "go.sum" }}
+      - install_core_deps
+      - upgrade_go
       - run:
-          name: Install goreleaser-pro
-          environment:
-            GORELEASER_VERSION: 0.184.0
-            # checksum from `checksums.txt` file at https://github.com/goreleaser/goreleaser-pro/releases
-            GORELEASER_SHA: def0b9882e0fbb91727c73bcc033917c4562aa5f9e89317884faff2b114c6b9c
+          # These files do not get uploaded by goreleaser when publish_release
+          # is false, but must be present to prevent a stat error
+          name: Touch dummy changelog files
           command: |
-            curl --proto '=https' --tlsv1.2 -sSfL --max-redirs 1 -O \
-              https://github.com/goreleaser/goreleaser-pro/releases/download/v${GORELEASER_VERSION}-pro/goreleaser-pro_Linux_x86_64.tar.gz
-            echo "${GORELEASER_SHA}  goreleaser-pro_Linux_x86_64.tar.gz" | sha256sum --check -
-            # Extract goreleaser binary only.
-            tar --extract --file=goreleaser-pro_Linux_x86_64.tar.gz goreleaser
-            rm goreleaser-pro_Linux_x86_64.tar.gz
-            # Move goreleaser binary out of project dir so it doesn't dirty the git state.
-            mv goreleaser /go/bin/
-      - run:
-          name: Run goreleaser
-          command: goreleaser --debug release --config .goreleaser/<< parameters.build-type >>.yml
-      # goreleaser generates some temp files in the dist/
-      # directory alongside the artifacts we want to save.
+            mkdir changelog_artifacts
+            touch changelog_artifacts/CHANGELOG.md
+            touch changelog_artifacts/changelog-commit.txt
+      - run_goreleaser:
+          publish_release: false
       - run:
           name: Clean up artifacts
           command: |
+            # goreleaser generates some temp files in the dist/
+            # directory alongside the artifacts we want to save.
             mkdir artifacts
             mv dist/influx* artifacts/
       - store_artifacts:
@@ -715,9 +830,9 @@ jobs:
       - persist_to_workspace:
           root: .
           paths:
-            - artifacts
+            - artifacts/*amd64.deb
 
-  test-linux-packages:
+  pkg_run_test:
     executor: terraform/default
     steps:
       - attach_workspace:
@@ -732,7 +847,7 @@ jobs:
           name: Terraform apply
           command: |
             set -x
-            export DEBNAME="$(find /tmp/workspace/artifacts/influxdb2-*-amd64.deb)"
+            export DEBNAME="$(find /tmp/workspace/artifacts/influxdb2-*amd64.deb)"
             terraform -chdir=scripts/ci init -input=false
             AWS_ACCESS_KEY_ID=$TEST_AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY=$TEST_AWS_SECRET_ACCESS_KEY terraform \
               -chdir=scripts/ci \
@@ -767,51 +882,32 @@ jobs:
               destroy \
                 -auto-approve
 
-  perf-test:
-    docker:
-      - image: cimg/base:2021.04
-    resource_class: small
+
+  perf_test:
+    executor: linux-amd64
     parameters:
-      record_results:
+      format:
+        type: string
+      record_ingest_results:
         type: boolean
     steps:
       - attach_workspace:
           at: /tmp/workspace
       - checkout
-      # To ssh into aws without failing host key checks
       - add_ssh_keys:
           fingerprints:
             - "91:0a:5b:a7:f9:46:77:f3:5d:4a:cf:d2:44:c8:2c:5a"
       - run:
-          name: Set up AWS CLI
-          command: |
-            ./scripts/ci/install-aws-cli.sh
-            echo "export AWS_ACCESS_KEY_ID=${TEST_AWS_ACCESS_KEY_ID}" >> vars.sh
-            echo "export AWS_SECRET_ACCESS_KEY=${TEST_AWS_SECRET_ACCESS_KEY}" >> vars.sh
-            echo "export TEST_RECORD_RESULTS=<< parameters.record_results >>" >> vars.sh
-            echo 'export DATA_I_TYPE="r5.2xlarge"' >>  vars.sh
-      - run:
-          name: Set up AWS instance
-          command: |
-            scripts/ci/perf_test.sh
-      - run:
-          name: Run perf test
+          name: Run test in AWS instance
           no_output_timeout: 20m
-          command: |
-            source vars.sh
-            set -x
-            ssh "ubuntu@$EC2_IP" "sudo ./run_perftest.sh"
-      - run:
-          name: Tear down AWS instance
-          when: always
-          command: |
-            source vars.sh
-            set -x
-            if [[ -n "$EC2_INSTANCE_ID" ]] ; then
-              aws --region us-west-2 ec2 terminate-instances --instance-ids "$EC2_INSTANCE_ID"
-            fi
+          command: >
+            AWS_ACCESS_KEY_ID=${TEST_AWS_ACCESS_KEY_ID}
+            AWS_SECRET_ACCESS_KEY=${TEST_AWS_SECRET_ACCESS_KEY}
+            TEST_FORMAT=<< parameters.format >>
+            TEST_RECORD_INGEST_RESULTS=<< parameters.record_ingest_results >>
+            scripts/ci/perf_test.sh
 
-  aws-destroy-by-date:
+  aws_destroy_by_date:
     executor: linux-amd64
     steps:
       - attach_workspace:
@@ -841,25 +937,101 @@ jobs:
                 AWS_ACCESS_KEY_ID=${TEST_AWS_ACCESS_KEY_ID} AWS_SECRET_ACCESS_KEY=${TEST_AWS_SECRET_ACCESS_KEY} aws --region us-west-2 ec2 terminate-instances --instance-ids $instance_id
               fi
             done
+  aws_destroy_by_name:
+    executor: linux-amd64
+    steps:
+      - attach_workspace:
+          at: /tmp/workspace
+      - checkout
+      - add_ssh_keys:
+          fingerprints:
+            - "91:0a:5b:a7:f9:46:77:f3:5d:4a:cf:d2:44:c8:2c:5a"
+      - run:
+          name: Destroy AWS instances by constructing name from arguments
+          no_output_timeout: 20m
+          command: |
+            set -x
+            name=oss-perftest-<< pipeline.parameters.aws_teardown_datestring >>-<< pipeline.parameters.aws_teardown_branch >>-<< pipeline.parameters.aws_teardown_sha >>-<< pipeline.parameters.aws_teardown_query_format >>
+            instance_id=$(AWS_ACCESS_KEY_ID=${TEST_AWS_ACCESS_KEY_ID} AWS_SECRET_ACCESS_KEY=${TEST_AWS_SECRET_ACCESS_KEY} aws --region us-west-2 ec2 describe-instances --filters "Name=tag:Name,Values=$name" --query 'Reservations[].Instances[].InstanceId' --output text)
+            AWS_ACCESS_KEY_ID=${TEST_AWS_ACCESS_KEY_ID} AWS_SECRET_ACCESS_KEY=${TEST_AWS_SECRET_ACCESS_KEY} aws --region us-west-2 ec2 terminate-instances --instance-ids $instance_id
 
-  e2e-monitor-ci:
-    docker:
-      - image: cimg/base:stable
+  release:
+    executor: linux-amd64
+    environment:
+      TMPDIR: /mnt/ramdisk
+    working_directory: /home/circleci/go/src/github.com/influxdata/influxdb
+    steps:
+      - checkout
+      - when:
+          condition: << pipeline.parameters.build_and_sign_tag >>
+          steps:
+            - run:
+                name: checkout by tag
+                command: |
+                  git fetch --all --tags
+                  git checkout tags/<< pipeline.parameters.build_and_sign_tag >> -b << pipeline.parameters.build_and_sign_tag >>
+      - run:
+          name: Create RAM disk
+          command: |
+            sudo mkdir -p ${TMPDIR}
+            sudo mount -t tmpfs -o size=4G tmpfs ${TMPDIR}
+      - restore_cache:
+          name: Restore GOPATH/pkg/mod
+          keys:
+            - influxdb-gomod-sum-{{ checksum "go.sum" }}
+      - install_core_deps
+      - upgrade_go
+      - run_goreleaser:
+          publish_release: true
+          build_tag: << pipeline.parameters.build_and_sign_tag >>
+      - persist_to_workspace:
+          root: .
+          paths:
+            - etc/litmus_success_notify.sh
+            - etc/litmus_fail_notify.sh
+
+  deploy_nightly:
+    executor: linux-amd64
+    environment:
+      TMPDIR: /mnt/ramdisk
+    working_directory: /home/circleci/go/src/github.com/influxdata/influxdb
     steps:
       - checkout
       - attach_workspace:
-          at: .
-      - setup_remote_docker
-      - quay_login
+          at: /tmp/workspace
       - run:
-          name: Build and push candidate docker image
+          name: Create RAM disk
           command: |
-            cp bin/influxd_linux_amd64/influxd .
-            docker build -f docker/influxd/Dockerfile -t quay.io/influxdb/oss-acceptance:${CIRCLE_SHA1} .
-            docker push quay.io/influxdb/oss-acceptance:${CIRCLE_SHA1}
+            sudo mkdir -p ${TMPDIR}
+            sudo mount -t tmpfs -o size=4G tmpfs ${TMPDIR}
+      - restore_cache:
+          name: Restore GOPATH/pkg/mod
+          keys:
+            - influxdb-gomod-sum-{{ checksum "go.sum" }}
+      - install_core_deps
+      - upgrade_go
+      - run_goreleaser:
+          publish_release: false
+          nightly: true
+      - persist_to_workspace:
+          root: .
+          paths:
+            - dist/influxd_linux_amd64/influxd
+            - etc/litmus_success_notify.sh
+            - etc/litmus_fail_notify.sh
+
+  #################################
+  ### e2e/integration test jobs ###
+  #################################
+
+  e2e-monitor-ci:
+    docker:
+      - image: cimg/go:1.17.2
+    steps:
+      - checkout
       - run:
           name: Run the tests
-          command: API_KEY=${MONITOR_CI_API_KEY} MONITOR_CI_BRANCH="master" OSS_SHA=${CIRCLE_SHA1} RUN_WORKFLOW="build_oss" ./scripts/ci/run-monitor-ci-tests.bash
+          command: API_KEY=${MONITOR_CI_API_KEY} MONITOR_CI_BRANCH="master" OSS_SHA=${CIRCLE_SHA1} UI_SHA="cc65325af35078b6886dac24357a88c9f815369d" UI_BRANCH="OSS-2.1" RUN_WORKFLOW="build_oss_embedded" ./scripts/ci/run-monitor-ci-tests.bash
       - store_artifacts:
           path: monitor-ci/test-artifacts/results/build-oss-image
           destination: test_artifacts/results/build-oss-image
@@ -870,37 +1042,54 @@ jobs:
           path: monitor-ci/test-artifacts/results/shared
           destination: test_artifacts/results/shared
 
-  litmus-smoke-test:
+  litmus_daily:
     executor: linux-amd64
     steps:
       - attach_workspace:
           at: ~/project
-      - run: docker run --entrypoint "./run_litmus_tests_oss.sh" -e ONE_TEST=src/cloud/rest_api/smoke/test_smoke.py -e BINARYPATH=/Litmus/result/bin/influxd_linux_amd64/influxd -e BOLTPATH=/Litmus/result/influxd_test/influxd.bolt -e ENGINEPATH=/Litmus/result/influxd_test --net host -v /var/run/docker.sock:/var/run/docker.sock -v ~/project:/Litmus/result quay.io/influxdb/litmus:latest
+      - run: docker run --entrypoint "./run_litmus_tests_oss.sh" -e ONE_TEST=src/cloud/rest_api/smoke/test_smoke.py -e BINARYPATH=/Litmus/result/dist/influxd_linux_amd64/influxd -e BOLTPATH=/Litmus/result/influxd_test/influxd.bolt -e ENGINEPATH=/Litmus/result/influxd_test --net host -v /var/run/docker.sock:/var/run/docker.sock -v ~/project:/Litmus/result quay.io/influxdb/litmus:latest
+      - run:
+          name: Litmus Smoke Tests Success
+          when: on_success
+          command: bash ~/project/etc/litmus_success_notify.sh Smoke
+          path: ~/project
+      - run:
+          name: Litmus Smoke Tests Fail
+          when: on_fail
+          command: bash ~/project/etc/litmus_fail_notify.sh Smoke
       - store_artifacts:
           path: ~/project
           destination: raw-daily-output
       - store_test_results:
           path: ~/project
 
-  litmus-full-test:
+  litmus_integration:
     executor: linux-amd64
     steps:
       - attach_workspace:
           at: ~/project
-      - run: docker run --entrypoint "./run_litmus_tests_oss.sh" -e TEST_LIST=tests_lists/gateway_api_tests.list -e BINARYPATH=/Litmus/result/bin/influxd_linux_amd64/influxd -e BOLTPATH=/tmp/influxd_test/influxd.bolt -e ENGINEPATH=/tmp/influxd_test --net host -v /var/run/docker.sock:/var/run/docker.sock -v ~/project:/Litmus/result quay.io/influxdb/litmus:latest
+      - run: docker run --entrypoint "./run_litmus_tests_oss.sh" -e TEST_LIST=tests_lists/gateway_api_tests.list -e BINARYPATH=/Litmus/result/dist/influxd_linux_amd64/influxd -e BOLTPATH=/tmp/influxd_test/influxd.bolt -e ENGINEPATH=/tmp/influxd_test --net host -v /var/run/docker.sock:/var/run/docker.sock -v ~/project:/Litmus/result quay.io/influxdb/litmus:latest
+      - run:
+          name: Litmus Integration Tests Success
+          when: on_success
+          command: bash ~/project/etc/litmus_success_notify.sh Integration
+      - run:
+          name: Litmus Integration Tests Failure
+          when: on_fail
+          command: bash ~/project/etc/litmus_fail_notify.sh Integration
       - store_artifacts:
           path: ~/project
           destination: raw-daily-output
       - store_test_results:
           path: ~/project
 
-  grace-test:
+  grace_daily:
     executor: linux-amd64
     steps:
       - attach_workspace:
           at: ~/project
       - run:
-          command: ./bin/influxd_linux_amd64/influxd --store=memory --log-level=debug
+          command: ./dist/influxd_linux_amd64/influxd --store=memory --log-level=debug
           background: true
       - run: mkdir -p ~/project/results
       - run:
@@ -924,27 +1113,29 @@ jobs:
 
   test-downgrade:
     executor: cross-builder
+    working_directory: /home/circleci/go/src/github.com/influxdata/influxdb
     steps:
       - checkout
       - attach_workspace:
-          at: .
+          at: /home/circleci/go/src/github.com/influxdata/influxdb
       - run:
           name: Run downgrade tests
           command: |
-            ./scripts/ci/test-downgrade.sh $(pwd)/bin/influxd_linux_amd64/influxd
+            ./scripts/ci/test-downgrade.sh $(pwd)/dist/influxd_linux_amd64/influxd
 
   share-testing-image:
-    docker:
-      - image: cimg/base:stable
+    executor: linux-amd64
+    working_directory: /home/circleci/go/src/github.com/influxdata/influxdb
     steps:
-      - setup_remote_docker
+      - attach_workspace:
+          at: /home/circleci/go/src/github.com/influxdata/influxdb
       - quay_login
       - run:
           name: Push the image to Quay
           command: |
-            docker pull quay.io/influxdb/oss-acceptance:${CIRCLE_SHA1}
-            docker tag quay.io/influxdb/oss-acceptance:${CIRCLE_SHA1} quay.io/influxdb/oss-acceptance:latest
-            docker push quay.io/influxdb/oss-acceptance:latest
+            docker load < docker-image.tar
+            docker tag quay.io/influxdb/oss-acceptance:${CIRCLE_SHA1} quay.io/influxdb/oss-acceptance:2.1
+            docker push quay.io/influxdb/oss-acceptance:2.1
 
   changelog:
     docker:
@@ -963,6 +1154,11 @@ jobs:
               VERSION="<< pipeline.git.tag >>"
               DOCS_LINKS_VERSION="$(echo "$VERSION" | sed 's/\.[^.]*$//')"
               BRANCH="$(echo "$DOCS_LINKS_VERSION" | sed 's/v//' )"
+            fi
+
+            # Runs triggered via the API parameters do have the branch parameter, but make sure the right version is used.
+            if [ -n "<< pipeline.parameters.build_and_sign_tag >>" ]; then
+              VERSION="<< pipeline.parameters.build_and_sign_tag >>"
             fi
 
             mkdir changelog_artifacts
