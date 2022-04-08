@@ -135,6 +135,33 @@ func (a *QueryAuthorizer) AuthorizeDatabase(u User, priv influxql.Privilege, dat
 	}
 }
 
+func (a *QueryAuthorizer) AuthorizeCreateDatabaseOrRetentionPolicy(u User) error {
+	if u == nil {
+		return &ErrAuthorize{
+			Message: "no user provided",
+		}
+	}
+
+	switch user := u.(type) {
+	case *UserInfo:
+		if !user.Admin {
+			return &ErrAuthorize{
+				Message: fmt.Sprintf("user %q, requires %s to create a database or retention policy", u.ID(), influxql.AllPrivileges),
+			}
+		}
+		return nil
+	default:
+	}
+	return &ErrAuthorize{
+		User:    u.ID(),
+		Message: fmt.Sprintf("Internal error - incorrect oss user type %T", u),
+	}
+}
+
+func (a *QueryAuthorizer) AuthorizeDeleteDatabaseOrRetentionPolicy(u User, db string) error {
+	return a.AuthorizeDatabase(u, influxql.AllPrivileges, db)
+}
+
 // ErrAuthorize represents an authorization error.
 type ErrAuthorize struct {
 	Query    *influxql.Query

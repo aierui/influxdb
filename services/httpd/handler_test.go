@@ -1835,6 +1835,149 @@ func TestHandler_Delete_V2(t *testing.T) {
 	}
 }
 
+func TestHandler_Buckets(t *testing.T) {
+	const existingDb = "mydb"
+	const newDb = "newDb"
+	const goodRp = "myrp"
+	const postMethod = "POST"
+	const deleteMethod = "DELETE"
+
+	type test struct {
+		url    string
+		method string
+		body   httpd.BucketsBody
+		status int
+		errMsg string
+	}
+
+	tests := []*test{
+		{
+			url:    "/api/v2/buckets",
+			method: postMethod,
+			body: httpd.BucketsBody{
+				Name:       newDb + "/" + goodRp,
+				Rp:         goodRp,
+				SchemaType: "implicit",
+				RetentionRules: []httpd.RetentionRule{
+					httpd.RetentionRule{
+						EverySeconds:              7200,
+						ShardGroupDurationSeconds: 14400,
+					},
+				},
+			},
+			status: http.StatusOK,
+		},
+		{
+			url:    "/api/v2/buckets?bucketID=baddb/" + goodRp,
+			method: deleteMethod,
+			status: http.StatusBadRequest,
+			errMsg: `delete bucket "baddb/myrp": database not found: "baddb"`,
+		},
+		{
+			url:    "/api/v2/buckets?bucketID=" + existingDb + "/badrp",
+			method: deleteMethod,
+			status: http.StatusBadRequest,
+			errMsg: `delete bucket "mydb/badrp": retention policy in database "mydb" not found: "badrp"`,
+		},
+		{
+			url:    "/api/v2/buckets",
+			method: postMethod,
+			body: httpd.BucketsBody{
+				Name:       existingDb + "/" + goodRp,
+				Rp:         goodRp,
+				SchemaType: "implicit",
+				RetentionRules: []httpd.RetentionRule{
+					httpd.RetentionRule{
+						EverySeconds:              7200,
+						ShardGroupDurationSeconds: 14400,
+					},
+				},
+			},
+			status: http.StatusOK,
+		},
+		{
+			url:    "/api/v2/buckets?bucketID=" + existingDb + "/" + goodRp,
+			method: deleteMethod,
+			status: http.StatusOK,
+		},
+	}
+
+	createRp := func(database string, spec *meta.RetentionPolicySpec, makeDefault bool) (*meta.RetentionPolicyInfo, error) {
+		return &meta.RetentionPolicyInfo{
+			Name:               spec.Name,
+			ReplicaN:           *spec.ReplicaN,
+			Duration:           *spec.Duration,
+			ShardGroupDuration: spec.ShardGroupDuration,
+		}, nil
+	}
+
+	lookupDb := func(name string) *meta.DatabaseInfo {
+		if name == existingDb {
+			return &meta.DatabaseInfo{
+				Name:                   name,
+				DefaultRetentionPolicy: goodRp,
+				RetentionPolicies:      []meta.RetentionPolicyInfo{meta.RetentionPolicyInfo{Name: goodRp}},
+			}
+		} else {
+			return nil
+		}
+	}
+
+	dropDeleteRp := func(database, rp string) error {
+		if dbi := lookupDb(database); dbi == nil {
+			return fmt.Errorf("database not found: %q", database)
+		} else if len(dbi.RetentionPolicies) <= 0 || dbi.RetentionPolicies[0].Name != rp {
+			return fmt.Errorf("retention policy in database %q not found: %q", database, rp)
+		} else {
+			return nil
+		}
+	}
+
+	h := NewHandler(false)
+
+	h.MetaClient = &internal.MetaClientMock{
+		DatabaseFn:              lookupDb,
+		CreateRetentionPolicyFn: createRp,
+		CreateDatabaseWithRetentionPolicyFn: func(name string, spec *meta.RetentionPolicySpec) (*meta.DatabaseInfo, error) {
+			rpi, err := createRp(name, spec, true)
+			return &meta.DatabaseInfo{
+				Name:                   name,
+				DefaultRetentionPolicy: spec.Name,
+				RetentionPolicies:      []meta.RetentionPolicyInfo{*rpi},
+				ContinuousQueries:      nil,
+			}, err
+		},
+		DropRetentionPolicyFn: dropDeleteRp,
+	}
+
+	h.Store.DeleteRetentionPolicyFn = dropDeleteRp
+	h.Handler.Store = h.Store
+	h.Handler.MetaClient = h.MetaClient
+
+	var req *http.Request
+	fn := func(ct *test) {
+		w := httptest.NewRecorder()
+		if body, err := json.Marshal(&ct.body); err != nil {
+			t.Fatalf("error marshaling body: %s", err)
+		} else {
+			req = MustNewJSONRequest(ct.method, ct.url, bytes.NewReader(body))
+		}
+		h.ServeHTTP(w, req)
+		var errMsg string
+		if w.Code != ct.status {
+			t.Fatalf("error, expected %d got %d: %s", ct.status, w.Code, errMsg)
+		} else if w.Code != http.StatusOK {
+			errMsg = w.Header().Get("X-InfluxDB-Error")
+			if errMsg != ct.errMsg {
+				t.Fatalf("incorrect error message, expected: %q, got: %q", ct.errMsg, errMsg)
+			}
+		}
+	}
+	for _, ct := range tests {
+		fn(ct)
+	}
+}
+
 // Ensure X-Forwarded-For header writes the correct log message.
 func TestHandler_XForwardedFor(t *testing.T) {
 	var buf bytes.Buffer
@@ -2279,7 +2422,9 @@ func (e *HandlerStatementExecutor) ExecuteStatement(ctx *query.ExecutionContext,
 
 // HandlerQueryAuthorizer is a mock implementation of Handler.QueryAuthorizer.
 type HandlerQueryAuthorizer struct {
-	AuthorizeQueryFn func(u meta.User, query *influxql.Query, database string) error
+	AuthorizeQueryFn                           func(u meta.User, query *influxql.Query, database string) error
+	AuthorizeCreateDatabaseOrRetentionPolicyFn func(u meta.User) error
+	AuthorizeDeleteDatabaseOrRetentionPolicyFn func(u meta.User, db string) error
 }
 
 func (a *HandlerQueryAuthorizer) AuthorizeQuery(u meta.User, q *influxql.Query, database string) (query.FineAuthorizer, error) {
@@ -2287,7 +2432,15 @@ func (a *HandlerQueryAuthorizer) AuthorizeQuery(u meta.User, q *influxql.Query, 
 }
 
 func (a *HandlerQueryAuthorizer) AuthorizeDatabase(u meta.User, priv influxql.Privilege, database string) error {
-	panic("not implemented")
+	panic("AuthorizeDatabase: not implemented")
+}
+
+func (a *HandlerQueryAuthorizer) AuthorizeCreateDatabaseOrRetentionPolicy(u meta.User) error {
+	return a.AuthorizeCreateDatabaseOrRetentionPolicyFn(u)
+}
+
+func (a *HandlerQueryAuthorizer) AuthorizeDeleteDatabaseOrRetentionPolicy(u meta.User, db string) error {
+	return a.AuthorizeDeleteDatabaseOrRetentionPolicyFn(u, db)
 }
 
 type HandlerPointsWriter struct {
