@@ -1835,7 +1835,7 @@ func TestHandler_Delete_V2(t *testing.T) {
 	}
 }
 
-func TestHandler_Buckets(t *testing.T) {
+func TestHandler_CreateDeleteBuckets(t *testing.T) {
 	const existingDb = "mydb"
 	const newDb = "newDb"
 	const goodRp = "myrp"
@@ -1970,6 +1970,177 @@ func TestHandler_Buckets(t *testing.T) {
 			errMsg = w.Header().Get("X-InfluxDB-Error")
 			if errMsg != ct.errMsg {
 				t.Fatalf("incorrect error message, expected: %q, got: %q", ct.errMsg, errMsg)
+			}
+		}
+	}
+	for _, ct := range tests {
+		fn(ct)
+	}
+}
+
+var testBuckets = []meta.DatabaseInfo{
+	{
+		Name:              "dbOne",
+		RetentionPolicies: []meta.RetentionPolicyInfo{{Name: "rpOne_1"}, {Name: "rpTwo_1"}, {Name: "rpThree_1"}},
+	},
+	{
+		Name:              "dbTwo",
+		RetentionPolicies: []meta.RetentionPolicyInfo{{Name: "rpOne_2"}, {Name: "rpTwo_2"}, {Name: "rpThree_2"}, {Name: "rpFour_2"}},
+	},
+	{
+		Name:              "dbThree",
+		RetentionPolicies: []meta.RetentionPolicyInfo{{Name: "rpOne_3"}},
+	},
+}
+
+func getBuckets(offset, limit int) []string {
+	i := 0
+	buckets := make([]string, 0, 8)
+
+	for _, dbi := range testBuckets {
+		for _, rpi := range dbi.RetentionPolicies {
+			if limit <= (i - offset) {
+				return buckets
+			}
+			if i >= offset {
+				buckets = append(buckets, fmt.Sprintf("%s/%s", dbi.Name, rpi.Name))
+			}
+			i++
+		}
+	}
+	return buckets
+}
+
+func TestHandler_ListBuckets(t *testing.T) {
+
+	type test struct {
+		url    string
+		status int
+		errMsg string
+		skip   int
+		limit  int
+	}
+
+	tests := []*test{
+		{
+			url:    "/api/v2/buckets?id=dbOne/rpTwo_1&name=NotThere/rpTwo_1",
+			status: http.StatusBadRequest,
+			skip:   1,
+			limit:  1,
+			errMsg: "list buckets: name: \"NotThere/rpTwo_1\" and id: \"dbOne/rpTwo_1\" do not match",
+		},
+		{
+			url:    "/api/v2/buckets?after=dbOne/rpTwo_1&limit=4",
+			status: http.StatusOK,
+			skip:   2,
+			limit:  4,
+		},
+		{
+			url:    "/api/v2/buckets?after=dbOne/rpThree_1",
+			status: http.StatusOK,
+			skip:   3,
+			limit:  20,
+		},
+		{
+			url:    "/api/v2/buckets?after=dbTwo/rpTwo_2",
+			status: http.StatusOK,
+			skip:   5,
+			limit:  20,
+		},
+		{
+			url:    "/api/v2/buckets?id=dbOne/rpTwo_1&name=dbOne/rpTwo_1",
+			status: http.StatusOK,
+			skip:   1,
+			limit:  1,
+		},
+		{
+			url:    "/api/v2/buckets?id=dbOne/rpTwo_1",
+			status: http.StatusOK,
+			skip:   1,
+			limit:  1,
+		},
+		{
+			url:    "/api/v2/buckets?name=dbOne/rpTwo_1",
+			status: http.StatusOK,
+			skip:   1,
+			limit:  1,
+		},
+		{
+			url:    "/api/v2/buckets?offset=3&after=dbOne/rpOne_1",
+			status: http.StatusBadRequest,
+			skip:   0,
+			limit:  20,
+			errMsg: "list buckets cannot have both \"offset\" and \"after\" arguments",
+		},
+		{
+			url:    "/api/v2/buckets?offset=3&limit=4",
+			status: http.StatusOK,
+			skip:   3,
+			limit:  4,
+		},
+		{
+			url:    "/api/v2/buckets?offset=1&limit=5",
+			status: http.StatusOK,
+			skip:   1,
+			limit:  5,
+		},
+		{
+			url:    "/api/v2/buckets",
+			status: http.StatusOK,
+			skip:   0,
+			limit:  20,
+		},
+	}
+
+	lookupDbFn := func(name string) *meta.DatabaseInfo {
+		for i := 0; i < len(testBuckets); i++ {
+			if testBuckets[i].Name == name {
+				return &testBuckets[i]
+			}
+		}
+		return nil
+	}
+
+	dbsFn := func() []meta.DatabaseInfo {
+		return testBuckets
+	}
+
+	h := NewHandler(false)
+
+	h.MetaClient = &internal.MetaClientMock{
+		DatabaseFn:  lookupDbFn,
+		DatabasesFn: dbsFn,
+	}
+
+	h.Handler.MetaClient = h.MetaClient
+
+	var req *http.Request
+	fn := func(ct *test) {
+		w := httptest.NewRecorder()
+		req = MustNewJSONRequest("GET", ct.url, nil)
+		h.ServeHTTP(w, req)
+		var errMsg string
+		if w.Code != ct.status {
+			t.Fatalf("error, expected %d got %d: %s", ct.status, w.Code, errMsg)
+		} else if w.Code != http.StatusOK {
+			errMsg = w.Header().Get("X-InfluxDB-Error")
+			if errMsg != ct.errMsg {
+				t.Fatalf("incorrect error message, expected: %q, got: %q", ct.errMsg, errMsg)
+			}
+		} else {
+			var got []httpd.Bucket
+			exp := getBuckets(ct.skip, ct.limit)
+
+			if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+				t.Fatalf("unmarshaling buckets: %s", err.Error())
+			}
+			if len(exp) != len(got) {
+				t.Fatalf("expected %d buckets returned, got %d", len(exp), len(got))
+			}
+			for i := 0; i < len(got); i++ {
+				if exp[i] != got[i].Name {
+					t.Fatalf("expected %q, got %q", exp[i], got[i].Name)
+				}
 			}
 		}
 	}

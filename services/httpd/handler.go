@@ -215,6 +215,11 @@ func NewHandler(c Config) *Handler {
 			"delete-bucket",
 			"DELETE", "/api/v2/buckets", false, true, h.serveBucketDeleteV2,
 		},
+
+		Route{
+			"buckets",
+			"GET", "/api/v2/buckets", false, true, h.serveBucketListV2,
+		},
 		Route{
 			"write", // Data-ingest route.
 			"POST", "/api/v2/write", true, writeLogEnabled, h.serveWriteV2,
@@ -818,7 +823,7 @@ func (h *Handler) async(q *influxql.Query, results <-chan *query.Result) {
 // bucket2drbp extracts a bucket and retention policy from a properly formatted
 // string.
 //
-// The 2.x compatible endpoints encode the databse and retention policy names
+// The 2.x compatible endpoints encode the database and retention policy names
 // in the database URL query value.  It is encoded using a forward slash like
 // "database/retentionpolicy" and we should be able to simply split that string
 // on the forward slash.
@@ -1019,6 +1024,15 @@ type BucketsBody struct {
 	RetentionRules []RetentionRule `json:"retentionRules"`
 }
 
+type Bucket struct {
+	BucketsBody
+	ID                  string    `json:"id,omitempty"`
+	Type                string    `json:"type"`
+	RetentionPolicyName string    `json:"rp,omitempty"` // This to support v1 sources
+	CreatedAt           time.Time `json:"createdAt"`
+	UpdatedAt           time.Time `json:"updatedAt"`
+}
+
 func (h *Handler) serveBucketsV2(w http.ResponseWriter, r *http.Request, user meta.User) {
 	var bs []byte
 	if r.ContentLength > 0 {
@@ -1134,6 +1148,163 @@ func (h *Handler) serveBucketDeleteV2(w http.ResponseWriter, r *http.Request, us
 	if err = h.MetaClient.DropRetentionPolicy(db, rp); err != nil {
 		h.httpError(w, fmt.Sprintf("delete bucket %q: %s", id, err.Error()), http.StatusBadRequest)
 		return
+	}
+}
+
+func (h *Handler) serveBucketListV2(w http.ResponseWriter, r *http.Request, user meta.User) {
+	var err error
+	var db, rp, after string
+	limit := 20
+	offset := 0
+
+	id := r.URL.Query().Get("id")
+	name := r.URL.Query().Get("name")
+	if id != "" || name != "" {
+		if id != "" && name != "" && id != name {
+			h.httpError(w, fmt.Sprintf("list buckets: name: %q and id: %q do not match", name, id), http.StatusBadRequest)
+			return
+		} else if id != "" {
+			name = id
+		}
+		db, rp, err = bucket2dbrp(name)
+		if err != nil {
+			h.httpError(w, fmt.Sprintf("list buckets %q: %s", name, err.Error()), http.StatusNotFound)
+			return
+		}
+		if dbi := h.MetaClient.Database(db); dbi == nil {
+			h.httpError(w, fmt.Sprintf("list buckets %q: bucket not found", name), http.StatusNotFound)
+			return
+		} else if rpi := dbi.RetentionPolicy(rp); rpi == nil {
+			h.httpError(w, fmt.Sprintf("list buckets %q: bucket not found", name), http.StatusNotFound)
+			return
+		} else {
+			sendBuckets(w, []Bucket{*makeBucket(rpi, db)})
+			return
+		}
+	}
+
+	if after = r.URL.Query().Get("after"); after != "" {
+		db, rp, err = bucket2dbrp(after)
+		if err != nil {
+			h.httpError(w, fmt.Sprintf("list buckets invalid parameter - after=%q: %s", after, err.Error()), http.StatusNotFound)
+			return
+		}
+	}
+
+	if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
+		if l, err := strconv.ParseInt(limitStr, 10, 64); err != nil {
+			h.httpError(w, fmt.Sprintf("list buckets parameter is not an integer - limit=%q: %s", limitStr, err.Error()), http.StatusBadRequest)
+			return
+		} else {
+			limit = int(l)
+		}
+	}
+
+	if offsetStr := r.URL.Query().Get("offset"); offsetStr != "" {
+		if after != "" {
+			h.httpError(w, "list buckets cannot have both \"offset\" and \"after\" arguments", http.StatusBadRequest)
+			return
+		} else if o, err := strconv.ParseInt(offsetStr, 10, 64); err != nil {
+			h.httpError(w, fmt.Sprintf("list buckets parameter is not an integer - offset=%q: %s", offsetStr, err.Error()), http.StatusBadRequest)
+			return
+		} else {
+			offset = int(o)
+		}
+	}
+
+	dbIndex := 0
+	rpIndex := 0
+	dbs := h.MetaClient.Databases()
+	if after != "" {
+		if dbIndex, rpIndex = findBucketIndex(dbs, db, rp); dbIndex < 0 {
+			h.httpError(w, fmt.Sprintf("list buckets \"after\" parameter not found: %q", after), http.StatusNotFound)
+			return
+		}
+	} else if offset > 0 {
+		if dbIndex, rpIndex = findBucketOffsetIndex(dbs, offset); dbIndex < 0 {
+			// TODO (DSB): Is this the right error?
+			http.Error(w, fmt.Sprintf("list buckets offset past end of list: %d", offset), http.StatusNotFound)
+			return
+		}
+	}
+
+	buckets := make([]Bucket, 0, limit)
+
+outer:
+	for ; dbIndex < len(dbs); dbIndex++ {
+		dbi := dbs[dbIndex]
+		for ; rpIndex < len(dbi.RetentionPolicies); rpIndex++ {
+			if limit > 0 {
+				buckets = append(buckets, *makeBucket(&dbi.RetentionPolicies[rpIndex], dbi.Name))
+				limit--
+			} else {
+				break outer
+			}
+		}
+		rpIndex = 0
+	}
+	sendBuckets(w, buckets)
+}
+
+func findBucketOffsetIndex(dbs []meta.DatabaseInfo, offset int) (dbIndex int, rpIndex int) {
+	for i, dbi := range dbs {
+		if offset > len(dbi.RetentionPolicies) {
+			offset -= len(dbi.RetentionPolicies)
+		} else {
+			dbIndex = i
+			rpIndex = offset
+			return dbIndex, rpIndex
+		}
+	}
+	return -1, -1
+}
+
+func findBucketIndex(dbs []meta.DatabaseInfo, db string, rp string) (dbIndex int, rpIndex int) {
+	for di, dbi := range dbs {
+		if dbi.Name != db {
+			continue
+		} else {
+			for ri, rpi := range dbi.RetentionPolicies {
+				if rpi.Name == rp {
+					if ri < (len(dbi.RetentionPolicies) - 1) {
+						return di, ri + 1
+					} else {
+						return di + 1, 0
+					}
+				}
+			}
+		}
+	}
+	return -1, -1
+}
+
+func sendBuckets(w http.ResponseWriter, buckets []Bucket) {
+	b, err := json.Marshal(buckets)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("list buckets marshaling error: %s", err.Error()), http.StatusBadRequest)
+		return
+	}
+	if _, err := w.Write(b); err != nil {
+		http.Error(w, fmt.Sprintf("list buckets error writing response: %s", err.Error()), http.StatusBadRequest)
+		return
+	}
+}
+
+func makeBucket(rpi *meta.RetentionPolicyInfo, database string) *Bucket {
+	name := fmt.Sprintf("%s/%s", database, rpi.Name)
+	return &Bucket{
+		BucketsBody: BucketsBody{
+			Name:       name,
+			Rp:         rpi.Name,
+			SchemaType: "implicit",
+			RetentionRules: []RetentionRule{{
+				Type:                      "",
+				EverySeconds:              int64(rpi.Duration.Seconds()),
+				ShardGroupDurationSeconds: int64(rpi.ShardGroupDuration.Seconds()),
+			}},
+		},
+		RetentionPolicyName: rpi.Name,
+		ID:                  name,
 	}
 }
 
